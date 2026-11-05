@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from .soul_protocol import (
     FrameDecoder,
@@ -35,6 +35,8 @@ SERVICE_UUID = "0000a002-0000-1000-8000-00805f9b34fb"
 WRITE_UUID = "0000c303-0000-1000-8000-00805f9b34fb"
 NOTIFY_UUID = "0000c305-0000-1000-8000-00805f9b34fb"
 COMMAND_INTERVAL = 3.0  # Match the successful direct-controller probe cadence.
+NOTIFY_SETTLE_DELAY = 1.0
+READ_RETRY_COOLDOWN = 2.0
 ClientFactory = Callable[["BLEDevice"], AbstractAsyncContextManager[Any]]
 
 
@@ -43,6 +45,16 @@ class SoulTransportError(Exception):
 
     def __init__(self, message: str, *, may_have_applied: bool = False) -> None:
         self.may_have_applied = may_have_applied
+        super().__init__(message)
+
+
+class SoulTimeoutError(SoulTransportError):
+    """A bounded response, connection, or notification-setup timeout."""
+
+    def __init__(
+        self, message: str, *, phase: Literal["response", "connection", "notify"]
+    ) -> None:
+        self.phase = phase
         super().__init__(message)
 
 
@@ -169,7 +181,9 @@ class _Exchange:
                 if command == b"AT+SAVE=0\r"
                 else "configuration write"
             )
-            raise SoulTransportError(f"SOUL {kind} response timed out") from None
+            raise SoulTimeoutError(
+                f"SOUL {kind} response timed out", phase="response"
+            ) from None
         finally:
             self.active = None
 
@@ -188,8 +202,9 @@ class SoulTransport:
     """One lock per instance; reuse one instance per device in the HA wrapper.
 
     Timeouts cover connection/notification setup and each command, respectively.
-    discovery_attempts bounds reconnects for incomplete discovery ONLY. No read,
-    configuration write, or save transaction is retried after dispatch.
+    discovery_attempts bounds reconnects for incomplete discovery ONLY. Explicit
+    read_config may repeat once on a typed timeout after cleanup and cooldown.
+    Apply transactions and individual commands are never retried after dispatch.
     """
 
     def __init__(
@@ -220,8 +235,8 @@ class SoulTransport:
                 async with asyncio.timeout(self._connect_timeout):
                     client = await manager.__aenter__()
             except TimeoutError:
-                raise SoulTransportError(
-                    "SOUL Bluetooth connection timed out"
+                raise SoulTimeoutError(
+                    "SOUL Bluetooth connection timed out", phase="connection"
                 ) from None
             try:
                 service = client.services.get_service(SERVICE_UUID)
@@ -251,9 +266,11 @@ class SoulTransport:
                     async with asyncio.timeout(self._connect_timeout):
                         await client.start_notify(NOTIFY_UUID, exchange.notify)
                 except TimeoutError:
-                    raise SoulTransportError(
-                        "SOUL notification setup timed out"
+                    raise SoulTimeoutError(
+                        "SOUL notification setup timed out", phase="notify"
                     ) from None
+                # No active queue: discard unsolicited/partial startup bytes.
+                await asyncio.sleep(NOTIFY_SETTLE_DELAY)
                 yield exchange
                 return
             finally:
@@ -262,11 +279,19 @@ class SoulTransport:
                 )
 
     async def read_config(self) -> SoulConfig:
-        """Read version and validated full snapshot without configuration writes."""
+        """Read a full snapshot; retry one typed timeout after clean disconnect."""
         async with self._lock:
             try:
-                async with self._connection() as exchange:
-                    return await exchange.read()
+                for attempt in range(2):
+                    try:
+                        async with self._connection() as exchange:
+                            return await exchange.read()
+                    except SoulTimeoutError:
+                        if attempt == 1:
+                            raise
+                        # Context exit completed successfully before recovery.
+                        # Keep the operation lock held through the cooldown.
+                        await asyncio.sleep(READ_RETRY_COOLDOWN)
             except (SoulTransportError, SoulProtocolError):
                 raise
             except Exception as err:  # noqa: BLE001 -- redact backend errors containing payloads

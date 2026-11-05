@@ -37,6 +37,17 @@ required before applying. A failure after dispatch can mean settings already
 changed; the implementation does not automatically retry the write or undo it.
 Close other controller apps while managing settings and check the result.
 
+Explicit **Read configuration** retries the whole read-only transaction at most
+once (two attempts total), only for typed connection, notification-setup, or
+response timeouts. Recovery waits for clean disconnect, then a 2-second cooldown;
+cleanup failures, cancellation, invalid frames, and conflicts do not trigger it.
+Incomplete GATT discovery retains its separate bounded reconnects before commands.
+**Apply and save** never retries its transaction or commands, including its reads;
+failures after a configuration write starts retain the uncertainty warning.
+Every connection waits 1 second after notification setup before its first command,
+discarding idle notifications, and commands retain 3-second start-to-start spacing.
+These recovery changes are mock-tested, not newly verified on live hardware.
+
 These are serialized local operations with optimistic snapshot checks, **not
 an atomic transaction with the controller**. Other clients can race between
 read, write, save, and readback. There is no guarantee of zero external races.

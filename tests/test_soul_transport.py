@@ -135,9 +135,10 @@ class FakeClient:
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        pacing = patch.object(t, "COMMAND_INTERVAL", 0)
-        pacing.start()
-        self.addCleanup(pacing.stop)
+        for name in ("COMMAND_INTERVAL", "NOTIFY_SETTLE_DELAY", "READ_RETRY_COOLDOWN"):
+            delay = patch.object(t, name, 0)
+            delay.start()
+            self.addCleanup(delay.stop)
         self.radio = FakeRadio()
         self.transport = t.SoulTransport(object(), self.radio.factory, timeout=0.5)
         self.config = p.SoulConfig(p.VERIFIED_VERSION, BASELINE)
@@ -145,6 +146,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
     def assert_clean(self):
         self.assertEqual(self.radio.active, 0)
         self.assertEqual(self.radio.connections, self.radio.disconnects)
+        self.assertLessEqual(self.radio.max_active, 1)
 
     async def test_read(self):
         self.assertEqual(await self.transport.read_config(), self.config)
@@ -158,6 +160,36 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(
             self.radio.chunks[1][1] - self.radio.chunks[0][1], 0.055
         )
+        self.assert_clean()
+
+    async def test_notify_settle_discards_idle_bytes_and_preserves_pacing(self):
+        original = FakeClient.start_notify
+        notified = []
+        idle_queues = []
+
+        async def start_notify(client, uuid, callback):
+            await original(client, uuid, callback)
+            loop = asyncio.get_running_loop()
+            notified.append(loop.time())
+
+            def idle():
+                idle_queues.append(callback.__self__.active)
+                client.emit(b"\xffOK\rpartial")
+
+            loop.call_later(0.01, idle)
+
+        with (
+            patch.object(FakeClient, "start_notify", start_notify),
+            patch.object(t, "NOTIFY_SETTLE_DELAY", 0.04),
+            patch.object(t, "COMMAND_INTERVAL", 0.06),
+        ):
+            self.assertEqual(await self.transport.read_config(), self.config)
+        self.assertEqual(idle_queues, [None])
+        self.assertGreaterEqual(self.radio.chunks[0][1] - notified[0], 0.039)
+        self.assertGreaterEqual(
+            self.radio.chunks[1][1] - self.radio.chunks[0][1], 0.059
+        )
+        self.assertEqual(self.radio.commands, [b"AT+VERSTR\r", b"AT+CFG?\r"])
         self.assert_clean()
 
     async def test_apply_readback_before_save_finalread(self):
@@ -247,15 +279,154 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.radio.saved)
         self.assert_clean()
 
-    async def test_read_timeout_no_retry(self):
+    async def test_read_timeout_recovers_with_fresh_transaction_after_cooldown(self):
+        async def hook(client, command):
+            return self.radio.connections == 1 and command == failed_command
+
+        sleep = asyncio.sleep
+        cooldowns = []
+
+        async def tracked_sleep(delay):
+            if delay == 2:
+                cooldowns.append((self.radio.active, self.radio.disconnects))
+                return
+            await sleep(delay)
+
+        commands = [b"AT+VERSTR\r", b"AT+CFG?\r"]
+        for index, failed_command in enumerate(commands):
+            with self.subTest(command=failed_command):
+                self.radio = FakeRadio()
+                self.radio.hook = hook
+                cooldowns.clear()
+                transport = t.SoulTransport(object(), self.radio.factory, timeout=0.01)
+                with (
+                    patch.object(t, "READ_RETRY_COOLDOWN", 2),
+                    patch.object(t.asyncio, "sleep", tracked_sleep),
+                ):
+                    self.assertEqual(await transport.read_config(), self.config)
+                self.assertEqual(cooldowns, [(0, 1)])
+                self.assertEqual(self.radio.connections, 2)
+                self.assertEqual(self.radio.commands, commands[: index + 1] + commands)
+                self.assert_clean()
+
+    async def test_cancel_during_read_cooldown_never_reconnects(self):
+        cooling = asyncio.Event()
+        sleep = asyncio.sleep
+
+        async def hook(client, command):
+            return True
+
+        async def tracked_sleep(delay):
+            if delay == 2:
+                cooling.set()
+                await asyncio.Future()
+            await sleep(delay)
+
+        self.radio.hook = hook
+        transport = t.SoulTransport(object(), self.radio.factory, timeout=0.01)
+        with (
+            patch.object(t, "READ_RETRY_COOLDOWN", 2),
+            patch.object(t.asyncio, "sleep", tracked_sleep),
+        ):
+            task = asyncio.create_task(transport.read_config())
+            await asyncio.wait_for(cooling.wait(), timeout=1)
+            self.assert_clean()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual(self.radio.connections, 1)
+        self.assert_clean()
+
+    async def test_read_timeout_bounded_to_two_attempts(self):
         async def hook(client, command):
             return True
 
         self.radio.hook = hook
-        with self.assertRaises(t.SoulTransportError) as caught:
+        with self.assertRaises(t.SoulTimeoutError) as caught:
             await self.transport.read_config()
+        self.assertEqual(caught.exception.phase, "response")
+        self.assertEqual(str(caught.exception), "SOUL version read response timed out")
+        self.assertFalse(caught.exception.may_have_applied)
+        self.assertEqual(self.radio.connections, 2)
+        self.assertEqual(self.radio.commands, [b"AT+VERSTR\r"] * 2)
+        self.assert_clean()
+
+    async def test_notify_timeout_recovery_and_bounded_failure(self):
+        original = FakeClient.start_notify
+        for recover in (True, False):
+            with self.subTest(recover=recover):
+                self.radio = FakeRadio()
+                transport = t.SoulTransport(
+                    object(), self.radio.factory, connect_timeout=0.01
+                )
+
+                async def start_notify(client, uuid, callback):
+                    if not recover or self.radio.connections == 1:
+                        await asyncio.Future()
+                    await original(client, uuid, callback)
+
+                with patch.object(FakeClient, "start_notify", start_notify):
+                    if recover:
+                        self.assertEqual(await transport.read_config(), self.config)
+                    else:
+                        with self.assertRaises(t.SoulTimeoutError) as caught:
+                            await transport.read_config()
+                        self.assertEqual(caught.exception.phase, "notify")
+                self.assertEqual(self.radio.connections, 2)
+                self.assert_clean()
+
+    async def test_connection_timeout_recovery_and_bounded_failure(self):
+        for recover in (True, False):
+            with self.subTest(recover=recover):
+                self.radio = FakeRadio()
+
+                @asynccontextmanager
+                async def factory(device):
+                    async with self.radio.factory(device) as client:
+                        if not recover or self.radio.connections == 1:
+                            await asyncio.Future()
+                        yield client
+
+                transport = t.SoulTransport(object(), factory, connect_timeout=0.01)
+                if recover:
+                    self.assertEqual(await transport.read_config(), self.config)
+                else:
+                    with self.assertRaises(t.SoulTimeoutError) as caught:
+                        await transport.read_config()
+                    self.assertEqual(caught.exception.phase, "connection")
+                self.assertEqual(self.radio.connections, 2)
+                self.assert_clean()
+
+    async def test_cleanup_failure_prevents_read_recovery(self):
+        async def hook(client, command):
+            return True
+
+        @asynccontextmanager
+        async def factory(device):
+            async with self.radio.factory(device) as client:
+                try:
+                    yield client
+                finally:
+                    raise TimeoutError("disconnect failed")
+
+        self.radio.hook = hook
+        transport = t.SoulTransport(object(), factory, timeout=0.01)
+        with self.assertRaises(t.SoulTransportError) as caught:
+            await transport.read_config()
+        self.assertNotIsInstance(caught.exception, t.SoulTimeoutError)
+        self.assertEqual(self.radio.connections, 1)
+        self.assert_clean()
+
+    async def test_apply_initial_read_timeout_never_retries(self):
+        async def hook(client, command):
+            return True
+
+        self.radio.hook = hook
+        with self.assertRaises(t.SoulTimeoutError) as caught:
+            await self.transport.apply_config(self.config, {4: 1})
         self.assertFalse(caught.exception.may_have_applied)
         self.assertEqual(self.radio.connections, 1)
+        self.assertEqual(self.radio.commands, [b"AT+VERSTR\r"])
         self.assert_clean()
 
     async def test_mismatch_prevents_save(self):
@@ -316,6 +487,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
+        self.assertEqual(self.radio.connections, 1)
         self.assert_clean()
 
     async def test_concurrent_applies_serialized_second_conflicts(self):
@@ -332,6 +504,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_read_limits_and_malformed_data_disconnect(self):
         for data in (b"x" * 129, b"\xff", b"x\r" * 1100):
+            before = self.radio.connections
 
             async def hook(client, command, data=data):
                 client.emit(data)
@@ -340,6 +513,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             self.radio.hook = hook
             with self.assertRaises(p.SoulProtocolError):
                 await self.transport.read_config()
+            self.assertEqual(self.radio.connections, before + 1)
             self.assert_clean()
 
     async def test_no_payload_in_error(self):
@@ -390,6 +564,20 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(caught.exception.may_have_applied)
         self.assertEqual(self.radio.raw[19], 1)
         self.assertEqual(len(self.radio.commands), 3)
+        self.assertFalse(self.radio.saved)
+        self.assertEqual(self.radio.connections, 1)
+        self.assert_clean()
+
+    async def test_apply_readback_timeout_is_uncertain_without_retry(self):
+        async def hook(client, command):
+            return self.radio.write_started.is_set() and command == b"AT+VERSTR\r"
+
+        self.radio.hook = hook
+        with self.assertRaises(t.SoulTransportError) as caught:
+            await self.transport.apply_config(self.config, {4: 1})
+        self.assertTrue(caught.exception.may_have_applied)
+        self.assertEqual(self.radio.connections, 1)
+        self.assertEqual(len(self.radio.commands), 4)
         self.assertFalse(self.radio.saved)
         self.assert_clean()
 
