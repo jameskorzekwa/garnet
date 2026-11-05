@@ -25,7 +25,7 @@
     "garnet"
   ],
   "requirements": [
-    "bleak-retry-connector==4.7.1",
+    "bleak-retry-connector>=4.7.1",
     "bluetooth-sensor-state-data==1.9.2"
   ],
   "version": "1.5.0"

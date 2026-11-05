@@ -79,7 +79,7 @@ async def _default_client_factory(device: BLEDevice):
     from bleak_retry_connector import establish_connection
 
     client = await establish_connection(
-        BleakClient, device, "Garnet SOUL", max_attempts=1
+        BleakClient, device, "Garnet SOUL", max_attempts=1, use_services_cache=False
     )
     try:
         yield client

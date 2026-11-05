@@ -7,10 +7,26 @@ import unittest
 from contextlib import asynccontextmanager
 from itertools import pairwise
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from test_soul_protocol import BASELINE, PACKAGE, p
 
 t = importlib.import_module(f"{PACKAGE}.soul_transport")
+
+
+class ConnectionFactoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_never_reuses_partial_service_cache(self):
+        client = SimpleNamespace(disconnect=AsyncMock())
+        device = object()
+        with patch(
+            "bleak_retry_connector.establish_connection",
+            new=AsyncMock(return_value=client),
+        ) as connect:
+            async with t._default_client_factory(device) as actual:
+                self.assertIs(actual, client)
+            self.assertFalse(connect.call_args.kwargs["use_services_cache"])
+            self.assertEqual(connect.call_args.kwargs["max_attempts"], 1)
+            client.disconnect.assert_awaited_once()
 
 
 class FakeRadio:
