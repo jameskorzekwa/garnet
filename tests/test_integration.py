@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from home_assistant_bluetooth import BluetoothServiceInfo
 from homeassistant.config_entries import ConfigEntryState
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.setup import async_setup_component
@@ -80,6 +81,14 @@ async def test_setup_controls_services_unload(hass, enable_custom_integrations):
             return_value=lambda: None,
         ),
         patch("homeassistant.setup.async_process_deps_reqs", return_value=None),
+        patch(
+            "custom_components.garnet.manager.bluetooth.async_scanner_devices_by_address",
+            return_value=[object()],
+        ),
+        patch(
+            "custom_components.garnet.manager.bluetooth.async_request_active_scan",
+            new_callable=AsyncMock,
+        ) as scan,
     ):
         assert await async_setup_component(hass, DOMAIN, {})
         await hass.async_block_till_done()
@@ -87,6 +96,7 @@ async def test_setup_controls_services_unload(hass, enable_custom_integrations):
         manager = hass.data[MANAGERS][entry.entry_id]
         assert manager.snapshot is None
         assert manager._transport is None
+        scan.assert_not_awaited()
         registry = er.async_get(hass)
         entities = er.async_entries_for_config_entry(registry, entry.entry_id)
         selects = [entity for entity in entities if entity.domain == "select"]
@@ -175,6 +185,28 @@ async def test_setup_controls_services_unload(hass, enable_custom_integrations):
             assert hass.states.get(fresh.entity_id).state == "unavailable"
             assert hass.states.get(apply_button.entity_id).state == "unavailable"
             assert hass.states.get(read_button.entity_id).state != "unavailable"
+        scan.assert_not_awaited()
+        with (
+            patch(
+                "custom_components.garnet.manager.bluetooth.async_scanner_devices_by_address",
+                return_value=[],
+            ),
+            patch("custom_components.garnet.manager.SoulTransport") as constructor,
+        ):
+            with pytest.raises(HomeAssistantError, match="No connectable path"):
+                await hass.services.async_call(
+                    "button",
+                    "press",
+                    {"entity_id": read_button.entity_id},
+                    blocking=True,
+                )
+            await hass.async_block_till_done()
+            assert hass.states.get(fresh.entity_id).state == "unavailable"
+            assert hass.states.get(apply_button.entity_id).state == "unavailable"
+            assert not manager.writable
+            constructor.assert_not_called()
+            assert transport.apply_config.await_count == 1
+            scan.assert_awaited_once_with(hass, duration=10)
         assert await hass.config_entries.async_unload(entry.entry_id)
         assert manager.closed
         assert entry.entry_id not in hass.data[MANAGERS]

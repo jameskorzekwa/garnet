@@ -18,6 +18,16 @@ from .soul_transport import SoulTransport, SoulTransportError
 _LOGGER = logging.getLogger(__name__)
 
 
+class _NoConnectablePath(HomeAssistantError):
+    """A known, safe connection-admission failure."""
+
+    def __init__(self):
+        super().__init__(
+            "No connectable path to the controller; "
+            "check Bluetooth coverage and read configuration again"
+        )
+
+
 class SoulManager:
     """Serialize operations and keep staged edits separate from physical state."""
 
@@ -97,13 +107,21 @@ class SoulManager:
         self.notify()
         async with self._lock:
             try:
+                if not bluetooth.async_scanner_devices_by_address(
+                    self.hass, self.address, connectable=True
+                ):
+                    await bluetooth.async_request_active_scan(self.hass, duration=10)
+                    if not bluetooth.async_scanner_devices_by_address(
+                        self.hass, self.address, connectable=True
+                    ):
+                        raise _NoConnectablePath
+                # Resolve only after the scan window, never use remembered history
+                # as evidence that a scanner can currently connect.
                 device = bluetooth.async_ble_device_from_address(
                     self.hass, self.address, connectable=True
                 )
                 if device is None:
-                    raise HomeAssistantError(
-                        "No connectable Bluetooth device available"
-                    )
+                    raise _NoConnectablePath
                 if self._transport is None:
                     self._transport = SoulTransport(device)
                 else:
@@ -135,12 +153,16 @@ class SoulManager:
                 self.status = "uncertain"
                 detail = (
                     str(err)
-                    if isinstance(err, (SoulProtocolError, SoulTransportError))
+                    if isinstance(
+                        err, (SoulProtocolError, SoulTransportError, _NoConnectablePath)
+                    )
                     else type(err).__name__
                 )
                 _LOGGER.warning(
                     "SOUL %s failed: %s", "apply" if apply else "read", detail
                 )
+                if isinstance(err, _NoConnectablePath):
+                    raise HomeAssistantError(detail) from None
                 # Backend exceptions can contain payloads or addresses.
                 raise HomeAssistantError(
                     "Configuration uncertain; read configuration before applying again"

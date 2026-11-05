@@ -151,6 +151,17 @@ class _Exchange:
                     if accepts(frame):
                         return frame
                     raise SoulProtocolError("Unexpected response for command")
+        except TimeoutError:
+            kind = (
+                "version read"
+                if command == b"AT+VERSTR\r"
+                else "configuration read"
+                if command == b"AT+CFG?\r"
+                else "save"
+                if command == b"AT+SAVE=0\r"
+                else "configuration write"
+            )
+            raise SoulTransportError(f"SOUL {kind} response timed out") from None
         finally:
             self.active = None
 
@@ -197,8 +208,13 @@ class SoulTransport:
     async def _connection(self):
         for attempt in range(self._attempts):
             manager = self._factory(self.device)
-            async with asyncio.timeout(self._connect_timeout):
-                client = await manager.__aenter__()
+            try:
+                async with asyncio.timeout(self._connect_timeout):
+                    client = await manager.__aenter__()
+            except TimeoutError:
+                raise SoulTransportError(
+                    "SOUL Bluetooth connection timed out"
+                ) from None
             try:
                 service = client.services.get_service(SERVICE_UUID)
                 chars = (
@@ -223,8 +239,13 @@ class SoulTransport:
                 if type(limit) is not int or limit < 1:
                     raise SoulTransportError("Invalid BLE write size limit")
                 exchange = _Exchange(client, self._timeout, min(20, limit))
-                async with asyncio.timeout(self._connect_timeout):
-                    await client.start_notify(NOTIFY_UUID, exchange.notify)
+                try:
+                    async with asyncio.timeout(self._connect_timeout):
+                        await client.start_notify(NOTIFY_UUID, exchange.notify)
+                except TimeoutError:
+                    raise SoulTransportError(
+                        "SOUL notification setup timed out"
+                    ) from None
                 yield exchange
                 return
             finally:

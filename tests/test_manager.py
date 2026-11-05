@@ -25,7 +25,22 @@ def make_manager(hass, *, soul=True):
 
 
 @pytest.fixture
-def transport():
+def discovery():
+    with (
+        patch(
+            "custom_components.garnet.manager.bluetooth.async_scanner_devices_by_address",
+            return_value=[object()],
+        ) as paths,
+        patch(
+            "custom_components.garnet.manager.bluetooth.async_request_active_scan",
+            new_callable=AsyncMock,
+        ) as scan,
+    ):
+        yield paths, scan
+
+
+@pytest.fixture
+def transport(discovery):
     transport = MagicMock()
     snapshot = SoulConfig(VERIFIED_VERSION, bytes(36))
     transport.read_config = AsyncMock(return_value=snapshot)
@@ -152,3 +167,109 @@ async def test_apply_cancellation_invalidates_snapshot(hass, transport):
     assert not manager.busy
     with pytest.raises(HomeAssistantError):
         await manager.apply()
+
+
+@pytest.mark.parametrize("apply", [False, True])
+async def test_missing_path_sweeps_then_resolves_fresh(
+    hass, transport, discovery, apply
+):
+    manager = make_manager(hass)
+    await manager.read()
+    manager.stage(0, 1)
+    paths, scan = discovery
+    paths.side_effect = [[], [object()]]
+    fresh = object()
+
+    def resolve(*args, **kwargs):
+        scan.assert_awaited_once_with(hass, duration=10)
+        assert paths.call_count == 3  # initial read and both recovery checks
+        return fresh
+
+    with patch(
+        "custom_components.garnet.manager.bluetooth.async_ble_device_from_address",
+        side_effect=resolve,
+    ) as lookup:
+        await (manager.apply() if apply else manager.read())
+        lookup.assert_called_once_with(hass, manager.address, connectable=True)
+    assert transport.device is fresh
+    assert manager.writable
+    assert manager.status == "ready"
+
+
+async def test_valid_path_never_sweeps(hass, transport, discovery):
+    manager = make_manager(hass)
+    await manager.read()
+    manager.stage(0, 1)
+    await manager.apply()
+    paths, scan = discovery
+    paths.assert_called_with(hass, manager.address, connectable=True)
+    scan.assert_not_awaited()
+
+
+@pytest.mark.parametrize("apply", [False, True])
+async def test_missing_path_stays_disabled_without_io(
+    hass, transport, discovery, caplog, apply
+):
+    manager = make_manager(hass)
+    await manager.read()
+    manager.stage(0, 1)
+    transport.read_config.reset_mock()
+    paths, scan = discovery
+    paths.return_value = []
+    with pytest.raises(HomeAssistantError, match="No connectable path"):
+        await (manager.apply() if apply else manager.read())
+    scan.assert_awaited_once_with(hass, duration=10)
+    assert "No connectable path" in caplog.text
+    assert manager.snapshot is None
+    assert not manager.writable
+    assert not manager.busy
+    assert manager.status == "uncertain"
+    transport.read_config.assert_not_awaited()
+    transport.apply_config.assert_not_awaited()
+    with pytest.raises(HomeAssistantError):
+        await manager.apply()
+    assert scan.await_count == 1
+
+
+async def test_scan_backend_error_remains_redacted(hass, transport, discovery, caplog):
+    manager = make_manager(hass)
+    paths, scan = discovery
+    paths.return_value = []
+    scan.side_effect = HomeAssistantError("SECRET BACKEND PAYLOAD")
+    with pytest.raises(HomeAssistantError, match="uncertain") as err:
+        await manager.read()
+    assert "SECRET" not in str(err.value)
+    assert "SECRET" not in caplog.text
+    assert not manager.writable
+    transport.read_config.assert_not_awaited()
+    transport.apply_config.assert_not_awaited()
+
+
+async def test_scan_cancellation_invalidates_snapshot(hass, transport, discovery):
+    manager = make_manager(hass)
+    await manager.read()
+    paths, scan = discovery
+    paths.return_value = []
+    scan.side_effect = asyncio.CancelledError
+    with pytest.raises(asyncio.CancelledError):
+        await manager.apply()
+    assert manager.snapshot is None
+    assert not manager.writable
+    assert not manager.busy
+    transport.apply_config.assert_not_awaited()
+
+
+async def test_path_disappears_before_device_resolution(hass, transport, discovery):
+    manager = make_manager(hass)
+    paths, scan = discovery
+    paths.side_effect = [[], [object()]]
+    with patch(
+        "custom_components.garnet.manager.bluetooth.async_ble_device_from_address",
+        return_value=None,
+    ):
+        with pytest.raises(HomeAssistantError, match="No connectable path"):
+            await manager.read()
+    scan.assert_awaited_once_with(hass, duration=10)
+    assert not manager.writable
+    transport.read_config.assert_not_awaited()
+    transport.apply_config.assert_not_awaited()
