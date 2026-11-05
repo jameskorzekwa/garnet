@@ -3,7 +3,8 @@
 Installed and exercised on **Home Assistant 2026.11.0** with a **G708 SOUL**
 controller, firmware `G708_REVK_L433_ver_7.0.4`.
 
-Integration code: `3f36b97a2b0dc17d2564669b295f1d7334356d6a`, manifest 1.5.0.
+Initial verified integration code: `3f36b97a2b0dc17d2564669b295f1d7334356d6a`,
+manifest 1.5.0. Follow-up `547384d` adds read-only timeout recovery; see below.
 This is a direct, owner-authorized **development installation**, not a merged
 release. Fork PR #1 remains review-only until the owner approves merging.
 HACS was not installed on this HA instance; no HACS metadata was fabricated.
@@ -43,6 +44,21 @@ sequence has about 21 seconds of minimum spacing, plus connection/response
 time. This is pacing, not an automatic retry of a potentially applied write.
 
 ## Backup and rollback
+
+### Completion-audit follow-up
+
+A later audit read timed out waiting for the version response despite the
+earlier four successful reads. This is evidence of intermittent failure, not
+proof of permanently reliable reads. Revision `547384d` adds a one-second
+notification-settle delay and at most one reconnect/retry for a **read-only**
+typed timeout, after successful disconnect and a two-second cooldown. Malformed
+frames, cancellation and configuration writes are never retried. Local suite:
+**103 tests and 11 subtests passed**, with CI test/hassfest/HACS validation green.
+Final live audit of this revision passed **four consecutive configuration
+reads** (22.2, 7.0, 7.0, 7.0 seconds); each ended ready with Grey2=single.
+Installed transport and manager SHA256 hashes match the reviewed worktree.
+The original rollback archive was read and validated again. This demonstrates
+current behavior, not a guarantee against every future Bluetooth outage.
 
 Original integration 1.4.0 was archived on the trailer at:
 
