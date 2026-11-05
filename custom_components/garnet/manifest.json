@@ -1,6 +1,6 @@
 {
   "domain": "garnet",
-  "name": "Garnet 709-BT",
+  "name": "Garnet SeeLeveL",
   "bluetooth": [
     {
       "manufacturer_id": 305
@@ -10,18 +10,23 @@
     }
   ],
   "codeowners": [
-    "@dan.ter"
+    "@jameskorzekwa",
+    "@danTapps"
   ],
   "config_flow": true,
   "dependencies": [
     "bluetooth_adapters"
   ],
-  "documentation": "https://github.com/danTapps/garnet",
+  "documentation": "https://github.com/jameskorzekwa/garnet",
   "integration_type": "device",
   "iot_class": "local_push",
-  "issue_tracker": "https://github.com/danTapps/garnet/issues",
+  "issue_tracker": "https://github.com/jameskorzekwa/garnet/issues",
   "loggers": [
     "garnet"
   ],
-  "version": "1.4.0"
+  "requirements": [
+    "bleak-retry-connector>=4.7.1",
+    "bluetooth-sensor-state-data==1.9.2"
+  ],
+  "version": "1.5.0"
 }

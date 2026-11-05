@@ -6,10 +6,30 @@ from homeassistant.const import Platform
 
 DOMAIN = "garnet"
 
-PLATFORMS = [Platform.SENSOR]
+PLATFORMS = [Platform.SENSOR, Platform.SELECT, Platform.BUTTON]
+MANAGERS = "garnet_managers"
+TANK_FAULTS = {
+    101: "short",
+    102: "open",
+    103: "bit_counter",
+    104: "stack",
+    105: "missing_top",
+    106: "missing_bottom",
+    107: "no_calibration",
+    108: "checksum",
+    109: "range",
+    110: "disabled",
+    111: "initializing",
+    112: "bad_id",
+}
 
 MFR_ID_BTP3 = 305
 MFR_ID_BTP7 = 3264
+
+
+def is_soul_name(name: str | None) -> bool:
+    """Only a SOUL name identifies a potential management-capable controller."""
+    return bool(name and "soul" in name.casefold().replace("-", " ").split())
 
 
 class GarnetTypes(StrEnum):

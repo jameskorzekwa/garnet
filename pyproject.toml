@@ -1,0 +1,14 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+# Retain upstream exception syntax; execution and CI still use Python 3.14.
+target-version = "py313"
+line-length = 88
+include = ["custom_components/**/*.py", "tests/**/*.py"]
+
+[tool.ruff.lint]
+# Keep the baseline focused; do not impose a wholesale upstream style rewrite.
+select = ["E4", "E7", "E9", "F"]
