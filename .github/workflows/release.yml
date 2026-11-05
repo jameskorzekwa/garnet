@@ -1,42 +1,128 @@
----
-name: Release
+name: CI and release
 
 on:
-  release:
-    types:
-      - published
+  push:
+    paths-ignore: [AGENTS.md, '**/AGENTS.md']
+  pull_request:
+    paths-ignore: [AGENTS.md, '**/AGENTS.md']
+  workflow_dispatch:
+    inputs:
+      check_latest_import:
+        description: Import-only smoke check on HA 2026.11.0 (not harness tests)
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 0 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: garnet-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: requirements-test.txt
+      - run: python -m pip install -r requirements-test.txt
+      - run: python -m ruff check . scripts/release_version.py
+      - run: python -m ruff format --check . scripts/release_version.py
+      - run: python -m pytest -q
+
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master
+      - uses: hacs/action@main
+        with:
+          category: integration
+
+  latest-import:
+    if: github.event_name == 'workflow_dispatch' && inputs.check_latest_import
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - run: python -m pip install homeassistant==2026.11.0 bleak-retry-connector==4.7.1 bluetooth-sensor-state-data==1.9.2
+      - name: Install Core Bluetooth and USB import dependencies
+        run: |
+          python <<'PY'
+          import importlib.util
+          import json
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          root = Path(importlib.util.find_spec('homeassistant').origin).parent
+          requirements = []
+          for domain in ('bluetooth', 'usb'):
+              requirements.extend(json.loads((root / 'components' / domain / 'manifest.json').read_text())['requirements'])
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', *requirements])
+          PY
+      - name: Import only (no claim of harness or hardware compatibility)
+        run: |
+          python -c "import importlib; [importlib.import_module('custom_components.garnet.' + name) for name in ('config_flow', 'sensor', 'select', 'button', 'diagnostics', 'manager', 'soul_protocol', 'soul_transport')]"
+
   release:
-    name: Release Garnet
+    needs: [test, validate]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'jameskorzekwa/garnet'
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
     steps:
-      - name: ⤵️ Check out code from GitHub
-        uses: actions/checkout@v4
-
-      - name: 🔢 Adjust version number
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Select version and commit a patch bump only when needed
+        id: version
         shell: bash
         run: |
-          version="${{ github.event.release.tag_name }}"
-          version="${version,,}"
-          version="${version#v}"
-          yq e -P -o=json \
-            -i ".version = \"${version}\"" \
-            "${{ github.workspace }}/custom_components/garnet/manifest.json"
-      - name: 📦 Created zipped release package
-        shell: bash
-        run: |
-          cd "${{ github.workspace }}/custom_components/garnet"
-          zip garnet.zip -r ./
-      - name: 🔏 Sign release package
+          set -euo pipefail
+          git fetch origin main --tags
+          python scripts/release_version.py
+          if ! git diff --quiet -- custom_components/garnet/manifest.json; then
+            # Per-command identity; no persistent git configuration changes.
+            git add custom_components/garnet/manifest.json
+            version=$(python -c "import json; print(json.load(open('custom_components/garnet/manifest.json'))['version'])")
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "Bump version to $version"
+            # Checkout's default GITHUB_TOKEN prevents a recursive CI/release run.
+            git push origin HEAD:main
+          fi
+      - name: Package integration
+        working-directory: custom_components/garnet
+        run: zip -r ../../garnet.zip . -x '*/__pycache__/*' '*.pyc'
+      - name: Sign release package (retained from upstream)
         uses: sigstore/gh-action-sigstore-python@v3.0.0
         with:
-          inputs: ${{ github.workspace }}/custom_components/garnet/garnet.zip
-
-      - name: ⬆️ Upload zip to release
-        uses: softprops/action-gh-release@v2.0.8
-        with:
-          files: ${{ github.workspace }}/custom_components/garnet/garnet.zip
+          inputs: garnet.zip
+      - name: Publish matching tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$(git ls-remote origin refs/heads/main | cut -f1)"
+          if ! git rev-parse --verify --quiet "refs/tags/v$VERSION"; then
+            git tag "v$VERSION"
+            git push origin "refs/tags/v$VERSION"
+          fi
+          test "$(git rev-list -n 1 "v$VERSION")" = "$(git rev-parse HEAD)"
+          if ! gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release create "v$VERSION" --verify-tag --title "v$VERSION" --generate-notes
+          fi
+          gh release upload "v$VERSION" garnet.zip --clobber

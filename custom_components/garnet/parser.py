@@ -6,10 +6,10 @@ import logging
 from struct import unpack
 
 from bluetooth_data_tools import short_address
-from bluetooth_sensor_state_data import BluetoothData  # type: ignore  # noqa: PGH003
+from bluetooth_sensor_state_data import BluetoothData  # type: ignore
 from home_assistant_bluetooth import BluetoothServiceInfo
 
-from .const import MFR_ID_BTP3, MFR_ID_BTP7, GarnetTypes
+from .const import MFR_ID_BTP3, MFR_ID_BTP7, TANK_FAULTS, GarnetTypes, is_soul_name
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ class GarnetBluetoothDeviceData(BluetoothData):
 
         if MFR_ID_BTP7 in data.manufacturer_data:
             _LOGGER.debug("Raw BTP7 Manufacturer Data %s", hex_manufacturer_data)
-            self.model = "709-BTP7"
+            self.model = "G708 SOUL" if is_soul_name(data.name) else "709-BTP7"
             manufacturer_data = data.manufacturer_data
             data_bytes = manufacturer_data[MFR_ID_BTP7]
             msg_length = len(data_bytes)
@@ -113,7 +113,7 @@ class GarnetBluetoothDeviceData(BluetoothData):
 
     def _process_update_btp3(self, data: bytes) -> None:
         """Update from BLE advertisement data."""
-        (coach_id, sensor_type, sensor_value, sensor_volume, sensor_total, alarm) = (
+        (coach_id, sensor_type, sensor_value, _sensor_volume, _sensor_total, _alarm) = (
             unpack("@3sc3s3s3sc", data)
         )
 
@@ -148,7 +148,7 @@ class GarnetBluetoothDeviceData(BluetoothData):
 
         sensor_device_class = None
         if sensor_type == 13:
-            sensor_value = round(sensor_value / 10, 2)
+            sensor_value = round(sensor_value / 10, 2) if sensor_available else None
             sensor_measurement_unit = "V"
             sensor_device_class = "VOLTAGE"
         if 6 < sensor_type < 11:
@@ -176,9 +176,34 @@ class GarnetBluetoothDeviceData(BluetoothData):
             unk_4,
             lpg_1,
             voltage,
-            unk_6,
-            unk_7,
+            _unk_6,
+            _unk_7,
         ) = unpack("<HxBBBBBBBBBBB", data)
+
+        tanks = {
+            GarnetTypes.FRESH_TANK: fresh_1,
+            GarnetTypes.GREY_TANK: grey_1,
+            GarnetTypes.BLACK_TANK: black_1,
+            GarnetTypes.FRESH_TANK2: fresh_2,
+            GarnetTypes.GREY_TANK2: grey_2,
+            GarnetTypes.BLACK_TANK2: black_2,
+            GarnetTypes.LPG_TANK: lpg_1,
+        }
+        if self.model == "G708 SOUL":
+            tanks[GarnetTypes.GREY_TANK3] = unk_4
+            self.update_sensor(
+                key=GarnetTypes.GREY_TANK3,
+                native_unit_of_measurement="%",
+                native_value=unk_4 if unk_4 <= 100 else None,
+            )
+        for key, value in tanks.items():
+            self.update_sensor(
+                key=f"{key}_status",
+                native_unit_of_measurement=None,
+                native_value="ok"
+                if value <= 100
+                else TANK_FAULTS.get(value, "unknown_fault"),
+            )
 
         #        coach_id = int.from_bytes(coach_id, byteorder="little")
         #        sensor_type = int.from_bytes(sensor_type, byteorder="little")
@@ -252,4 +277,3 @@ class GarnetBluetoothDeviceData(BluetoothData):
             native_unit_of_measurement="%",
             native_value=lpg_1 if (lpg_1 > -1 and lpg_1 < 101) else None,
         )
-

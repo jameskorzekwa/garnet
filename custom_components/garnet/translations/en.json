@@ -1,5 +1,24 @@
 {
-    "config": {
+  "entity": {
+    "button": {
+      "read": {"name": "Read configuration"},
+      "apply": {"name": "Apply and save staged changes"},
+      "discard": {"name": "Discard changes"}
+    },
+    "select": {
+      "sender_mode": {"state": {"disabled": "Disabled", "single": "Single", "stacked": "Stacked"}}
+    },
+    "sensor": {
+      "management_status": {
+        "name": "Management status",
+        "state": {"not_read": "Read configuration required", "monitor_only": "Monitor only", "ready": "Ready", "staged": "Changes staged", "reading": "Reading", "applying": "Applying and saving", "uncertain": "Uncertain — read configuration required"}
+      },
+      "tank_status": {
+        "state": {"ok": "OK", "short": "Short circuit", "open": "Open circuit", "bit_counter": "Bit counter error", "stack": "Stack error", "missing_top": "Missing top sender", "missing_bottom": "Missing bottom sender", "no_calibration": "Not calibrated", "checksum": "Checksum error", "range": "Out of range", "disabled": "Disabled", "initializing": "Initializing", "bad_id": "Invalid sender ID", "unknown_fault": "Unknown fault"}
+      }
+    }
+  },
+  "config": {
         "abort": {
             "already_configured": "Device is already configured",
             "already_in_progress": "Configuration flow is already in progress",

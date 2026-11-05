@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Union
+from typing import ClassVar
 
 from homeassistant import config_entries
 from homeassistant.components.bluetooth.passive_update_processor import (
@@ -23,8 +23,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.sensor import sensor_device_info_to_hass_device_info
 
-from .const import DOMAIN, GarnetTypes
+from .const import DOMAIN, MANAGERS, TANK_FAULTS, GarnetTypes
 from .device import device_key_to_bluetooth_entity_key
+from .manager import SoulEntity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -130,6 +131,25 @@ SENSOR_DESCRIPTIONS = {
 }
 
 
+for tank in (
+    GarnetTypes.FRESH_TANK,
+    GarnetTypes.GREY_TANK,
+    GarnetTypes.BLACK_TANK,
+    GarnetTypes.FRESH_TANK2,
+    GarnetTypes.GREY_TANK2,
+    GarnetTypes.BLACK_TANK2,
+    GarnetTypes.GREY_TANK3,
+    GarnetTypes.LPG_TANK,
+):
+    SENSOR_DESCRIPTIONS[f"{tank}_status"] = SensorEntityDescription(
+        key=f"{tank}_status",
+        translation_key="tank_status",
+        device_class=SensorDeviceClass.ENUM,
+        options=["ok", *TANK_FAULTS.values(), "unknown_fault"],
+        entity_category=EntityCategory.DIAGNOSTIC,
+    )
+
+
 def sensor_update_to_bluetooth_data_update(sensor_update) -> PassiveBluetoothDataUpdate:
     """Convert a sensor update to a bluetooth data update."""
     return PassiveBluetoothDataUpdate(
@@ -170,17 +190,46 @@ async def async_setup_entry(
         )
     )
     entry.async_on_unload(coordinator.async_register_processor(processor))
+    async_add_entities([SoulStatusSensor(hass.data[MANAGERS][entry.entry_id])])
+
+
+class SoulStatusSensor(SoulEntity, SensorEntity):
+    """Management status without exporting controller configuration."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_translation_key = "management_status"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options: ClassVar[list[str]] = [
+        "not_read",
+        "monitor_only",
+        "ready",
+        "staged",
+        "reading",
+        "applying",
+        "uncertain",
+    ]
+
+    def __init__(self, manager):
+        super().__init__(manager, "management_status")
+
+    @property
+    def native_value(self):
+        return self.manager.status
+
+    @property
+    def extra_state_attributes(self):
+        return {"pending_changes": len(self.manager.changes)}
 
 
 class GarnetBluetoothSensorEntity(
     PassiveBluetoothProcessorEntity[
-        PassiveBluetoothDataProcessor[Optional[Union[float, int]], 1]  # noqa: UP007
+        PassiveBluetoothDataProcessor[float | int | str | None, object]
     ],
     SensorEntity,
 ):
     """Representation of a Garnet sensor."""
 
     @property
-    def native_value(self) -> int | float | None:
+    def native_value(self) -> int | float | str | None:
         """Return the native value."""
         return self.processor.entity_data.get(self.entity_key)
