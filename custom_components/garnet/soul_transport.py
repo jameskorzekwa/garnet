@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 SERVICE_UUID = "0000a002-0000-1000-8000-00805f9b34fb"
 WRITE_UUID = "0000c303-0000-1000-8000-00805f9b34fb"
 NOTIFY_UUID = "0000c305-0000-1000-8000-00805f9b34fb"
+COMMAND_INTERVAL = 3.0  # Match the successful direct-controller probe cadence.
 ClientFactory = Callable[["BLEDevice"], AbstractAsyncContextManager[Any]]
 
 
@@ -95,6 +96,7 @@ class _Exchange:
         self.active: asyncio.Queue[str | Exception] | None = None
         self.decoder = FrameDecoder()
         self.received = 0
+        self._last_command_at = float("-inf")
 
     def notify(self, _sender: Any, data: bytearray) -> None:
         queue = self.active
@@ -119,6 +121,11 @@ class _Exchange:
         *,
         require_echo: bool = False,
     ) -> str:
+        # Pace requests like the verified hardware probe; never retry writes.
+        loop = asyncio.get_running_loop()
+        remaining = COMMAND_INTERVAL - (loop.time() - self._last_command_at)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
         queue: asyncio.Queue[str | Exception] = asyncio.Queue(maxsize=32)
         self.decoder = FrameDecoder()
         self.received = 0
@@ -127,6 +134,7 @@ class _Exchange:
         echoed = False
         try:
             async with asyncio.timeout(self.timeout):
+                self._last_command_at = loop.time()
                 for offset in range(0, len(command), self.chunk_size):
                     if offset:
                         await asyncio.sleep(0.05)

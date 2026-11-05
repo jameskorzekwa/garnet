@@ -135,6 +135,9 @@ class FakeClient:
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        pacing = patch.object(t, "COMMAND_INTERVAL", 0)
+        pacing.start()
+        self.addCleanup(pacing.stop)
         self.radio = FakeRadio()
         self.transport = t.SoulTransport(object(), self.radio.factory, timeout=0.5)
         self.config = p.SoulConfig(p.VERIFIED_VERSION, BASELINE)
@@ -146,6 +149,15 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_read(self):
         self.assertEqual(await self.transport.read_config(), self.config)
         self.assertEqual(self.radio.commands, [b"AT+VERSTR\r", b"AT+CFG?\r"])
+        self.assert_clean()
+
+    async def test_request_pacing_is_not_a_retry(self):
+        with patch.object(t, "COMMAND_INTERVAL", 0.06):
+            self.assertEqual(await self.transport.read_config(), self.config)
+        self.assertEqual(len(self.radio.commands), 2)
+        self.assertGreaterEqual(
+            self.radio.chunks[1][1] - self.radio.chunks[0][1], 0.055
+        )
         self.assert_clean()
 
     async def test_apply_readback_before_save_finalread(self):
